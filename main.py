@@ -1397,7 +1397,7 @@ def main():
     choice = input("Enter choice (1/2/3/4): ").strip()
     
     # Default paths (modify these for your setup)
-    dataset_path = "/content/drive/Shared with me/TextSpotting/"  # Adjust this path
+    dataset_path = "/content/drive/Shared with me/totaltext/"  # Adjust this path
     save_path = "/content/drive/Shared with me/"
     
     if choice == "1":
