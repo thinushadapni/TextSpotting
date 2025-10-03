@@ -1397,8 +1397,8 @@ def main():
     choice = input("Enter choice (1/2/3/4): ").strip()
     
     # Default paths (modify these for your setup)
-    dataset_path = "/content/drive/Shared drives/TextSpotting/"  # Adjust this path
-    save_path = "/content/drive/Shared drives/"
+    dataset_path = "/content/drive/Shared with me/TextSpotting/"  # Adjust this path
+    save_path = "/content/drive/Shared with me/"
     
     if choice == "1":
         # Training only
