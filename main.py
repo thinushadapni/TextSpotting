@@ -14,6 +14,8 @@ from tqdm import tqdm
 import math
 import gc
 import warnings
+import numpy as np
+from scipy.optimize import linear_sum_assignment
 warnings.filterwarnings('ignore')
 
 # ============================================================================
@@ -497,154 +499,153 @@ class HungarianMatcher(nn.Module):
     Returns:
         list of (pred_indices_tensor, target_indices_tensor) per image in batch
     """
-    import numpy as np
-    from scipy.optimize import linear_sum_assignment
+   
 
-    bs, num_queries = outputs["pred_logits"].shape[:2]
-
-    # Flatten batch dimension for easy indexing
-    out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)        # [bs*num_queries, num_classes]
-    out_bbox = outputs["pred_boxes"].flatten(0, 1)                     # [bs*num_queries, 4]
-    out_polygon = outputs["pred_polygons"].flatten(0, 1)               # [bs*num_queries, 16]
-    out_text_logits = outputs["pred_texts"].flatten(0, 1)              # [bs*num_queries, max_text_len, vocab_size]
-
-    # Use the configured number of recognition queries (must be provided in the matcher)
-    rec_q = getattr(self, "num_recognition_queries", None)
-    if rec_q is None:
-        # fallback: assume last quarter are recognition queries (NOT ideal; set self.num_recognition_queries in init)
-        rec_q = min(num_queries, 25)
-
-    matches_per_image = []
-
-    for i in range(bs):
-        # extract per-image predicted slices
-        q_start = i * num_queries
-        q_end = (i + 1) * num_queries
-
-        preds_prob_i = out_prob[q_start:q_end]        # [num_queries, num_classes]
-        preds_bbox_i = out_bbox[q_start:q_end]        # [num_queries, 4]
-        preds_poly_i = out_polygon[q_start:q_end]     # [num_queries, 16]
-        preds_text_logits_i = out_text_logits[q_start:q_end]  # [num_queries, max_text_len, vocab_size]
-
-        tgt = targets[i]
-        tgt_ids = tgt.get("labels", torch.tensor([], dtype=torch.long, device=preds_prob_i.device))
-        tgt_bbox = tgt.get("boxes", torch.empty((0, 4), device=preds_bbox_i.device))
-        tgt_poly = tgt.get("polygons", torch.empty((0, preds_poly_i.shape[1]), device=preds_poly_i.device))
-        tgt_text = tgt.get("texts", torch.empty((0, preds_text_logits_i.shape[1]), dtype=torch.long, device=preds_text_logits_i.device))
-
-        num_targets = tgt_ids.shape[0]
-
-        # If there are no targets in this image, return empty match
-        if num_targets == 0:
-            matches_per_image.append((torch.empty(0, dtype=torch.int64), torch.empty(0, dtype=torch.int64)))
-            continue
-
-        # ---- Classification cost: negative log-prob of target class for each query ----
-        # preds_prob_i: [num_queries, num_classes]
-        # tgt_ids: [num_targets]
-        # result -> [num_queries, num_targets]
-        try:
-            cost_class = -preds_prob_i[:, tgt_ids]  # broadcasting picks columns for each tgt id
-        except Exception as e:
-            # If indexing fails for dtype reasons, convert tgt_ids to cpu long numpy then index
-            tgt_ids_cpu = tgt_ids.to(torch.long).cpu().numpy()
-            cost_class = -preds_prob_i[:, tgt_ids_cpu]
-
-        # ---- Box L1 cost ----
-        if tgt_bbox.numel() == 0:
-            cost_bbox = torch.zeros((num_queries, 0), device=preds_bbox_i.device)
-            cost_giou = torch.zeros((num_queries, 0), device=preds_bbox_i.device)
-        else:
-            # ensure finite
-            preds_bbox_i = torch.nan_to_num(preds_bbox_i, nan=0.0, posinf=1e6, neginf=-1e6)
-            tgt_bbox = torch.nan_to_num(tgt_bbox, nan=0.0, posinf=1e6, neginf=-1e6)
-
-            cost_bbox = torch.cdist(preds_bbox_i, tgt_bbox, p=1)  # [num_queries, num_targets]
-
-            # giou cost (negative giou to turn into a minimization)
+        bs, num_queries = outputs["pred_logits"].shape[:2]
+    
+        # Flatten batch dimension for easy indexing
+        out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)        # [bs*num_queries, num_classes]
+        out_bbox = outputs["pred_boxes"].flatten(0, 1)                     # [bs*num_queries, 4]
+        out_polygon = outputs["pred_polygons"].flatten(0, 1)               # [bs*num_queries, 16]
+        out_text_logits = outputs["pred_texts"].flatten(0, 1)              # [bs*num_queries, max_text_len, vocab_size]
+    
+        # Use the configured number of recognition queries (must be provided in the matcher)
+        rec_q = getattr(self, "num_recognition_queries", None)
+        if rec_q is None:
+            # fallback: assume last quarter are recognition queries (NOT ideal; set self.num_recognition_queries in init)
+            rec_q = min(num_queries, 25)
+    
+        matches_per_image = []
+    
+        for i in range(bs):
+            # extract per-image predicted slices
+            q_start = i * num_queries
+            q_end = (i + 1) * num_queries
+    
+            preds_prob_i = out_prob[q_start:q_end]        # [num_queries, num_classes]
+            preds_bbox_i = out_bbox[q_start:q_end]        # [num_queries, 4]
+            preds_poly_i = out_polygon[q_start:q_end]     # [num_queries, 16]
+            preds_text_logits_i = out_text_logits[q_start:q_end]  # [num_queries, max_text_len, vocab_size]
+    
+            tgt = targets[i]
+            tgt_ids = tgt.get("labels", torch.tensor([], dtype=torch.long, device=preds_prob_i.device))
+            tgt_bbox = tgt.get("boxes", torch.empty((0, 4), device=preds_bbox_i.device))
+            tgt_poly = tgt.get("polygons", torch.empty((0, preds_poly_i.shape[1]), device=preds_poly_i.device))
+            tgt_text = tgt.get("texts", torch.empty((0, preds_text_logits_i.shape[1]), dtype=torch.long, device=preds_text_logits_i.device))
+    
+            num_targets = tgt_ids.shape[0]
+    
+            # If there are no targets in this image, return empty match
+            if num_targets == 0:
+                matches_per_image.append((torch.empty(0, dtype=torch.int64), torch.empty(0, dtype=torch.int64)))
+                continue
+    
+            # ---- Classification cost: negative log-prob of target class for each query ----
+            # preds_prob_i: [num_queries, num_classes]
+            # tgt_ids: [num_targets]
+            # result -> [num_queries, num_targets]
             try:
-                preds_xy = box_cxcywh_to_xyxy(preds_bbox_i)
-                tgt_xy = box_cxcywh_to_xyxy(tgt_bbox)
-                giou = bbox_giou(preds_xy, tgt_xy)  # expected [num_queries, num_targets]
-                cost_giou = -giou
-            except Exception:
-                # If giou fails, use a fallback large constant (so it won't dominate)
-                cost_giou = torch.full((num_queries, num_targets), 1e3, device=preds_bbox_i.device)
-
-        # ---- Polygon L1 cost ----
-        if tgt_poly.numel() == 0:
-            cost_polygon = torch.zeros((num_queries, 0), device=preds_poly_i.device)
-        else:
-            preds_poly_i = torch.nan_to_num(preds_poly_i, nan=0.0, posinf=1e6, neginf=-1e6)
-            tgt_poly = torch.nan_to_num(tgt_poly, nan=0.0, posinf=1e6, neginf=-1e6)
-            cost_polygon = torch.cdist(preds_poly_i, tgt_poly, p=1)
-
-        # ---- Text recognition cost ----
-        # Build a matrix [num_queries, num_targets] where only recognition queries have finite costs
-        LARGE_COST = 1e6
-        cost_text = torch.full((num_queries, num_targets), LARGE_COST, device=preds_text_logits_i.device)
-
-        # recognition queries are assumed to be last `rec_q` queries of this image
-        rec_start = max(0, num_queries - rec_q)
-        rec_indices = torch.arange(rec_start, num_queries, device=preds_text_logits_i.device, dtype=torch.long)
-
-        if tgt_text.numel() > 0:
-            # For each recognition query, compute CE against each target text (sum across tokens)
-            for rec_idx in rec_indices.tolist():
-                query_logits = preds_text_logits_i[rec_idx]  # [max_text_len, vocab_size]
-                # convert to shape [max_text_len, vocab] -> [max_text_len, vocab]
-                for t_idx in range(num_targets):
-                    tgt_tokens = tgt_text[t_idx]  # [max_text_len]
-                    # ensure shapes, handle ignore_index (assumes pad index 0)
-                    try:
-                        ce = F.cross_entropy(
-                            query_logits.view(-1, query_logits.shape[-1]),
-                            tgt_tokens.view(-1),
-                            reduction='none',
-                            ignore_index=0
-                        )
-                        cost_text_val = ce.sum()
-                    except Exception:
-                        # if mismatch or other issue, set large cost
-                        cost_text_val = torch.tensor(LARGE_COST, device=preds_text_logits_i.device)
-
-                    cost_text[rec_idx, t_idx] = cost_text_val
-
-        # ---- Compose final cost matrix ----
-        # Weights stored on self: cost_class, cost_bbox, cost_giou, cost_polygon, cost_text
-        C = (self.cost_bbox * cost_bbox
-             + self.cost_class * cost_class
-             + self.cost_giou * cost_giou
-             + self.cost_polygon * cost_polygon
-             + self.cost_text * cost_text)
-
-        # Ensure C is finite and a numpy 2D array for SciPy
-        C = torch.nan_to_num(C, nan=LARGE_COST, posinf=LARGE_COST, neginf=-LARGE_COST)
-        C_np = C.cpu().numpy()
-
-        # Final safety: if any entry is inf or nan, replace
-        if not np.isfinite(C_np).all():
-            C_np = np.nan_to_num(C_np, nan=LARGE_COST, posinf=LARGE_COST, neginf=-LARGE_COST)
-
-        # SciPy Hungarian matcher expects a 2D matrix. If shape is (num_queries, num_targets)
-        # it's fine. If any dimension is zero, return empty match.
-        if C_np.size == 0 or C_np.shape[0] == 0 or C_np.shape[1] == 0:
-            matches_per_image.append((torch.empty(0, dtype=torch.int64), torch.empty(0, dtype=torch.int64)))
-            continue
-
-        # Try Hungarian, fallback to greedy argmin-per-target if it fails
-        try:
-            row_ind, col_ind = linear_sum_assignment(C_np)
-            row_ind = torch.as_tensor(row_ind, dtype=torch.int64)
-            col_ind = torch.as_tensor(col_ind, dtype=torch.int64)
-        except Exception as e:
-            # fallback: assign each target to argmin over queries (deterministic greedy)
-            row_ind = torch.as_tensor(np.argmin(C_np, axis=0), dtype=torch.int64)  # one query per target
-            col_ind = torch.as_tensor(np.arange(C_np.shape[1], dtype=np.int64), dtype=torch.int64)
-
-        matches_per_image.append((row_ind, col_ind))
-
-    return matches_per_image
+                cost_class = -preds_prob_i[:, tgt_ids]  # broadcasting picks columns for each tgt id
+            except Exception as e:
+                # If indexing fails for dtype reasons, convert tgt_ids to cpu long numpy then index
+                tgt_ids_cpu = tgt_ids.to(torch.long).cpu().numpy()
+                cost_class = -preds_prob_i[:, tgt_ids_cpu]
+    
+            # ---- Box L1 cost ----
+            if tgt_bbox.numel() == 0:
+                cost_bbox = torch.zeros((num_queries, 0), device=preds_bbox_i.device)
+                cost_giou = torch.zeros((num_queries, 0), device=preds_bbox_i.device)
+            else:
+                # ensure finite
+                preds_bbox_i = torch.nan_to_num(preds_bbox_i, nan=0.0, posinf=1e6, neginf=-1e6)
+                tgt_bbox = torch.nan_to_num(tgt_bbox, nan=0.0, posinf=1e6, neginf=-1e6)
+    
+                cost_bbox = torch.cdist(preds_bbox_i, tgt_bbox, p=1)  # [num_queries, num_targets]
+    
+                # giou cost (negative giou to turn into a minimization)
+                try:
+                    preds_xy = box_cxcywh_to_xyxy(preds_bbox_i)
+                    tgt_xy = box_cxcywh_to_xyxy(tgt_bbox)
+                    giou = bbox_giou(preds_xy, tgt_xy)  # expected [num_queries, num_targets]
+                    cost_giou = -giou
+                except Exception:
+                    # If giou fails, use a fallback large constant (so it won't dominate)
+                    cost_giou = torch.full((num_queries, num_targets), 1e3, device=preds_bbox_i.device)
+    
+            # ---- Polygon L1 cost ----
+            if tgt_poly.numel() == 0:
+                cost_polygon = torch.zeros((num_queries, 0), device=preds_poly_i.device)
+            else:
+                preds_poly_i = torch.nan_to_num(preds_poly_i, nan=0.0, posinf=1e6, neginf=-1e6)
+                tgt_poly = torch.nan_to_num(tgt_poly, nan=0.0, posinf=1e6, neginf=-1e6)
+                cost_polygon = torch.cdist(preds_poly_i, tgt_poly, p=1)
+    
+            # ---- Text recognition cost ----
+            # Build a matrix [num_queries, num_targets] where only recognition queries have finite costs
+            LARGE_COST = 1e6
+            cost_text = torch.full((num_queries, num_targets), LARGE_COST, device=preds_text_logits_i.device)
+    
+            # recognition queries are assumed to be last `rec_q` queries of this image
+            rec_start = max(0, num_queries - rec_q)
+            rec_indices = torch.arange(rec_start, num_queries, device=preds_text_logits_i.device, dtype=torch.long)
+    
+            if tgt_text.numel() > 0:
+                # For each recognition query, compute CE against each target text (sum across tokens)
+                for rec_idx in rec_indices.tolist():
+                    query_logits = preds_text_logits_i[rec_idx]  # [max_text_len, vocab_size]
+                    # convert to shape [max_text_len, vocab] -> [max_text_len, vocab]
+                    for t_idx in range(num_targets):
+                        tgt_tokens = tgt_text[t_idx]  # [max_text_len]
+                        # ensure shapes, handle ignore_index (assumes pad index 0)
+                        try:
+                            ce = F.cross_entropy(
+                                query_logits.view(-1, query_logits.shape[-1]),
+                                tgt_tokens.view(-1),
+                                reduction='none',
+                                ignore_index=0
+                            )
+                            cost_text_val = ce.sum()
+                        except Exception:
+                            # if mismatch or other issue, set large cost
+                            cost_text_val = torch.tensor(LARGE_COST, device=preds_text_logits_i.device)
+    
+                        cost_text[rec_idx, t_idx] = cost_text_val
+    
+            # ---- Compose final cost matrix ----
+            # Weights stored on self: cost_class, cost_bbox, cost_giou, cost_polygon, cost_text
+            C = (self.cost_bbox * cost_bbox
+                 + self.cost_class * cost_class
+                 + self.cost_giou * cost_giou
+                 + self.cost_polygon * cost_polygon
+                 + self.cost_text * cost_text)
+    
+            # Ensure C is finite and a numpy 2D array for SciPy
+            C = torch.nan_to_num(C, nan=LARGE_COST, posinf=LARGE_COST, neginf=-LARGE_COST)
+            C_np = C.cpu().numpy()
+    
+            # Final safety: if any entry is inf or nan, replace
+            if not np.isfinite(C_np).all():
+                C_np = np.nan_to_num(C_np, nan=LARGE_COST, posinf=LARGE_COST, neginf=-LARGE_COST)
+    
+            # SciPy Hungarian matcher expects a 2D matrix. If shape is (num_queries, num_targets)
+            # it's fine. If any dimension is zero, return empty match.
+            if C_np.size == 0 or C_np.shape[0] == 0 or C_np.shape[1] == 0:
+                matches_per_image.append((torch.empty(0, dtype=torch.int64), torch.empty(0, dtype=torch.int64)))
+                continue
+    
+            # Try Hungarian, fallback to greedy argmin-per-target if it fails
+            try:
+                row_ind, col_ind = linear_sum_assignment(C_np)
+                row_ind = torch.as_tensor(row_ind, dtype=torch.int64)
+                col_ind = torch.as_tensor(col_ind, dtype=torch.int64)
+            except Exception as e:
+                # fallback: assign each target to argmin over queries (deterministic greedy)
+                row_ind = torch.as_tensor(np.argmin(C_np, axis=0), dtype=torch.int64)  # one query per target
+                col_ind = torch.as_tensor(np.arange(C_np.shape[1], dtype=np.int64), dtype=torch.int64)
+    
+            matches_per_image.append((row_ind, col_ind))
+    
+        return matches_per_image
 
 # Helper functions for box transformations (usually in `util/box_ops.py` in DETR)
 def box_cxcywh_to_xyxy(x):
