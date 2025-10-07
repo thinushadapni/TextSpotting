@@ -594,19 +594,21 @@ class HungarianMatcher(nn.Module):
                 self.cost_giou * cost_giou + self.cost_polygon * cost_polygon + \
                 self.cost_text * cost_text_matrix_for_image # <--- USE THE NEW MATRIX HERE
                         
-            # Use `scipy` for matching
             import scipy.optimize
-            try:
-                indices = scipy.optimize.linear_sum_assignment(C.cpu())
-            except ValueError as e:
-                # Handle cases where C might have inf/nan if targets are empty or other issues
-                # Or if scipy cannot find a match
-                if "contains NaN" in str(e) or "contains infinity" in str(e) or C.shape[0] == 0 or C.shape[1] == 0:
-                    indices = (np.array([]), np.array([])) # No matches
-                else:
-                    raise e
+            import numpy as np
 
-            indices = (torch.as_tensor(indices[0], dtype=torch.int64), torch.as_tensor(indices[1], dtype=torch.int64))
+            try:
+    # Handle cases where C might be empty or contain invalid values
+                if C.numel() == 0 or C.shape[1] == 0 or C.shape[0] == 0:
+                    indices = (np.array([]), np.array([]))
+                else:
+                    # Replace inf/nan with large finite values for feasibility
+                    C = torch.where(torch.isfinite(C), C, torch.full_like(C, 1e6))
+                    indices = scipy.optimize.linear_sum_assignment(C.cpu())
+            except ValueError as e:
+                print(f"[WARNING] Matching skipped due to infeasible cost matrix at batch {i}: {e}")
+            indices = (np.array([]), np.array([]))
+
             cost_matrices.append(indices)
 
         return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in cost_matrices]
