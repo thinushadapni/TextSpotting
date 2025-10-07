@@ -1,6 +1,3 @@
-# Complete VimTS Implementation - All Components
-# File: complete_vimts.py
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -482,13 +479,14 @@ class HungarianMatcher(nn.Module):
         - Cross-entropy for text recognition (new)
     """
     def __init__(self, cost_class: float = 1, cost_bbox: float = 1, cost_giou: float = 1,
-                 cost_polygon: float = 1, cost_text: float = 1):
+                 cost_polygon: float = 1, cost_text: float = 1, num_recognition_queries: int = 25):
         super().__init__()
         self.cost_class = cost_class
         self.cost_bbox = cost_bbox
         self.cost_giou = cost_giou
         self.cost_polygon = cost_polygon
         self.cost_text = cost_text
+        self.num_recognition_queries = num_recognition_queries
         assert cost_class != 0 or cost_bbox != 0 or cost_giou != 0 or cost_polygon != 0 or cost_text != 0, "All costs can't be 0"
 
     @torch.no_grad()
@@ -551,86 +549,48 @@ class HungarianMatcher(nn.Module):
             
             # --- Polygon cost (L1) ---
             cost_polygon = torch.cdist(out_polygon[i * num_queries : (i + 1) * num_queries], tgt_polygon, p=1)
-            
-            # --- Text recognition cost (Cross-Entropy) ---
-            # Only consider the recognition queries for text cost
-            # And only if target text is available
-            cost_text = torch.zeros(num_queries, len(tgt_text), device=out_text_logits.device)
-            if len(tgt_text) > 0:
-                # Assuming last `num_recognition_queries` are for text
-                rec_queries_start_idx = num_queries - num_recognition_queries
-                
-                # Reshape text predictions and targets
-                pred_rec_text_logits = out_text_logits[i * num_queries : (i + 1) * num_queries, :, :] # All queries for now, will mask
-                
-                # Apply mask to text predictions for recognition queries and targets
-                # Flatten for F.cross_entropy
-                
-                # Replicate target text across num_recognition_queries for initial cost computation
-                # This will be refined during matching based on which queries are actually recognition queries
-                
-                # Simplified text cost (will be masked later if not a rec query match)
-                # This part is a bit tricky: we need to compute CE cost between *every* query's text output
-                # and *every* target text.
-                # A more accurate way is to only consider rec queries for the text cost component during matching.
-                # For simplicity here, let's compute for all queries but apply a mask or specific indexing.
-                
-                # A robust way is to compute this cost only for recognition queries vs targets.
-                # However, the cost matrix needs to be (num_queries, num_targets).
-                # We need a dummy cost for non-recognition queries, or a clever way to integrate.
-                # The original DETR implementation often makes text cost apply to ALL queries (zero for non-text objects),
-                # or uses specific query types.
 
-                # Let's align with how DETR might handle this: calculate text loss for *all* queries against *all* targets,
-                # but in practice, non-text predictions for text queries get high classification cost,
-                # and text predictions for detection queries are ignored during final loss summation.
-                
-                # Replicate each target text max_text_len times for CE calculation
-                tgt_text_expanded = tgt_text.unsqueeze(1).expand(-1, outputs['pred_texts'].shape[-2]).flatten() # [num_targets * max_text_len]
-                
-                # Get logits for all queries for CE calculation against expanded targets
-                # [num_queries, max_text_len, vocab_size] -> [num_queries * max_text_len, vocab_size]
-                pred_text_flat = pred_rec_text_logits.reshape(-1, out_text_logits.shape[-1])
-                
-                # Compute CE loss for each query against each target text (this will be a matrix of [num_queries, num_targets])
-                # This part needs careful alignment with DETR's text loss. A common way is to sum character-wise CE.
-                
-                # Dummy cost calculation for now, this needs proper integration with character-level CE.
-                # The true text cost involves reshaping pred_rec_text_logits and tgt_text, then F.cross_entropy,
-                # and summing across max_text_len for each query-target pair.
-                
-                # Here's a placeholder for calculating sum of char-level CE per query-target pair
-                text_cost_per_query_target = []
-                for q_idx in range(num_queries):
-                    query_text_logits = out_text_logits[i * num_queries + q_idx] # [max_text_len, vocab_size]
-                    costs_for_this_query = []
+            # --- Text recognition cost (Cross-Entropy) ---
+            # Initialize cost_text matrix with high value so non-recognition queries don't match text targets easily
+            cost_text_matrix_for_image = torch.full(
+                (num_queries, len(tgt_text)),
+                float('inf'), # Use 'inf' for non-text queries for matching
+                device=out_text_logits.device
+            )
+
+            if len(tgt_text) > 0:
+                # Determine which queries are actually recognition queries (the last `self.num_recognition_queries`)
+                # Only these queries will contribute to the text cost
+                rec_query_global_indices = torch.arange(
+                    num_queries - self.num_recognition_queries,
+                    num_queries,
+                    device=out_text_logits.device
+                )
+
+                for q_global_idx in rec_query_global_indices: # Iterate only over relevant recognition queries
+                    query_text_logits = out_text_logits[i * num_queries + q_global_idx] # [max_text_len, vocab_size]
+                    
+                    costs_for_this_query_vs_targets = []
                     for t_idx in range(len(tgt_text)):
                         target_char_ids = tgt_text[t_idx] # [max_text_len]
                         
-                        # Calculate CE for this query's predicted text against this target's text
-                        # Flatten for cross_entropy, mask padding token 0
+                        # Calculate CE for this recognition query's predicted text against this target's text
                         ce_loss = F.cross_entropy(query_text_logits.view(-1, query_text_logits.shape[-1]), 
                                                 target_char_ids.view(-1), 
-                                                reduction='none', ignore_index=0) # Ignore padding
+                                                reduction='none', ignore_index=0) # Ignore padding token 0
                         
-                        # Sum up character-level losses for this query-target pair
-                        costs_for_this_query.append(ce_loss.sum()) 
-                    if len(costs_for_this_query) > 0:
-                        text_cost_per_query_target.append(torch.stack(costs_for_this_query))
-                    else:
-                         text_cost_per_query_target.append(torch.zeros(len(tgt_text), device=out_text_logits.device))
-                
-                if len(text_cost_per_query_target) > 0:
-                    cost_text = torch.stack(text_cost_per_query_target) # [num_queries, num_targets]
-                else:
-                    cost_text = torch.zeros(num_queries, 0, device=out_text_logits.device) # No targets, no cost
-                
+                        costs_for_this_query_vs_targets.append(ce_loss.sum()) # Sum character-level losses
+                    
+                    if len(costs_for_this_query_vs_targets) > 0:
+                        # Assign the calculated costs only to the recognition query rows
+                        cost_text_matrix_for_image[q_global_idx, :] = torch.stack(costs_for_this_query_vs_targets)
             
             # --- Final Cost Matrix ---
+            # Use the refined cost_text_matrix_for_image here
             C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + \
                 self.cost_giou * cost_giou + self.cost_polygon * cost_polygon + \
-                self.cost_text * cost_text
-            
+                self.cost_text * cost_text_matrix_for_image # <--- USE THE NEW MATRIX HERE
+                        
             # Use `scipy` for matching
             import scipy.optimize
             try:
@@ -961,7 +921,7 @@ class VimTSDataset(Dataset):
         
         for ann in annotations:
             # Label (category_id)
-            labels.append(ann.get('category_id', 1))
+            # labels.append(ann.get('category_id', 1))
             
             # Bounding box - normalize to [0, 1]
             x, y, w, h = ann['bbox']
@@ -1132,14 +1092,10 @@ def train_vimts(dataset_path, num_epochs=10, batch_size=1, learning_rate=1e-4,
     print(f"Dataset size: {len(train_dataset)}")
     print(f"Batches per epoch: {len(train_loader)}")
     
-     # Create model
+    # Create model (ensure num_classes is 1 for a single 'text' positive class)
     print("\nInitializing model...")
-    # Update num_classes in model to reflect actual text categories (e.g., 1 for text, background handled by loss)
-    # The classification head will output num_classes + 1, where the last is background.
     model = MemoryOptimizedVimTS(
-        num_classes=1, # Text (0) and Background (1) will be handled by class head
-                        # For example, if you have only 'text' as a positive class,
-                        # pred_logits will be B x N x 2 (text, background)
+        num_classes=1, # This defines positive classes (e.g., just 'text'). Background is num_classes+1.
         vocab_size=96, # Adjust based on your actual character set
         max_text_len=25
     ).to(device)
@@ -1151,13 +1107,14 @@ def train_vimts(dataset_path, num_epochs=10, batch_size=1, learning_rate=1e-4,
     print(f"Trainable parameters: {trainable_params:,}")
     
     # Loss and optimizer
-    # Initialize the matcher
+    # Initialize the matcher, passing the correct num_recognition_queries from the model
     matcher = HungarianMatcher(
-        cost_class=1,  # DETR uses higher class weights typically
+        cost_class=1,  # You can tune these weights
         cost_bbox=5,
         cost_giou=2,
         cost_polygon=1,
-        cost_text=1 # Balance these weights based on your task and experimentation
+        cost_text=1,
+        num_recognition_queries=model.num_recognition_queries # <--- PASS THIS VALUE
     ).to(device)
 
     criterion = VimTSLoss(
@@ -1167,7 +1124,7 @@ def train_vimts(dataset_path, num_epochs=10, batch_size=1, learning_rate=1e-4,
         max_text_len=25,
         weight_class=2.0,
         weight_bbox=5.0,
-        weight_giou=2.0, # Add GIoU weight
+        weight_giou=2.0,
         weight_polygon=1.0,
         weight_text=1.0
     ).to(device)
@@ -1398,7 +1355,7 @@ def main():
     
     # Default paths (modify these for your setup)
     dataset_path = "/content/drive/MyDrive/totaltext/"  # Adjust this path
-    save_path = "/content/drive/MyDrive/totaltext/"
+    save_path = "/content/drive/MyDrive/"
     
     if choice == "1":
         # Training only
