@@ -1,3 +1,6 @@
+# Complete VimTS Implementation - All Components
+# File: complete_vimts.py
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,8 +17,6 @@ from tqdm import tqdm
 import math
 import gc
 import warnings
-import numpy as np
-from scipy.optimize import linear_sum_assignment
 warnings.filterwarnings('ignore')
 
 # ============================================================================
@@ -493,159 +494,122 @@ class HungarianMatcher(nn.Module):
 
     @torch.no_grad()
     def forward(self, outputs, targets):
-    """
-    Robust Hungarian matching forward pass.
-
-    Returns:
-        list of (pred_indices_tensor, target_indices_tensor) per image in batch
-    """
-   
-
+        """Performs the matching
+        Args:
+            outputs: This is a dict that contains at least these entries:
+                "pred_logits": Tensor of dim [batch_size, num_queries, num_classes] with the classification logits
+                "pred_boxes": Tensor of dim [batch_size, num_queries, 4] with the predicted box coordinates
+                "pred_polygons": Tensor of dim [batch_size, num_queries, 16] with predicted polygon coords
+                "pred_texts": Tensor of dim [batch_size, num_queries, max_text_len, vocab_size] with text logits
+            targets: This is a list of targets (len(targets) = batch_size), where each target is a dict containing:
+                "labels": Tensor of dim [num_target_boxes] (ground-truth classification labels)
+                "boxes": Tensor of dim [num_target_boxes, 4] (ground-truth box coordinates)
+                "polygons": Tensor of dim [num_target_boxes, 16] (ground-truth polygon coordinates)
+                "texts": Tensor of dim [num_target_boxes, max_text_len] (ground-truth text token IDs)
+        Returns:
+            A list of lists of tuples (pred_idx, target_idx) for each image in the batch,
+            representing the optimal matching between the predictions and target.
+        """
         bs, num_queries = outputs["pred_logits"].shape[:2]
-    
-        # Flatten batch dimension for easy indexing
-        out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)        # [bs*num_queries, num_classes]
-        out_bbox = outputs["pred_boxes"].flatten(0, 1)                     # [bs*num_queries, 4]
-        out_polygon = outputs["pred_polygons"].flatten(0, 1)               # [bs*num_queries, 16]
-        out_text_logits = outputs["pred_texts"].flatten(0, 1)              # [bs*num_queries, max_text_len, vocab_size]
-    
-        # Use the configured number of recognition queries (must be provided in the matcher)
-        rec_q = getattr(self, "num_recognition_queries", None)
-        if rec_q is None:
-            # fallback: assume last quarter are recognition queries (NOT ideal; set self.num_recognition_queries in init)
-            rec_q = min(num_queries, 25)
-    
-        matches_per_image = []
-    
+
+        # We flatten to compute the cost matrices in a batch
+        out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)  # [bs*num_queries, num_classes]
+        out_bbox = outputs["pred_boxes"].flatten(0, 1)  # [bs*num_queries, 4]
+        out_polygon = outputs["pred_polygons"].flatten(0, 1) # [bs*num_queries, 16]
+        
+        # Only take recognition queries for text matching
+        # Assuming recognition queries are the last `num_recognition_queries`
+        num_recognition_queries = outputs["pred_texts"].shape[1] # This should be 25 from your model
+        out_text_logits = outputs["pred_texts"].flatten(0, 1) # [bs*num_queries, max_text_len, vocab_size]
+        
+        # Placeholder for target processing, will be updated in loop
+        tgt_ids_list = [v["labels"] for v in targets]
+        tgt_bbox_list = [v["boxes"] for v in targets]
+        tgt_polygon_list = [v["polygons"] for v in targets]
+        tgt_text_list = [v["texts"] for v in targets]
+
+        # Costs per image
+        cost_matrices = []
         for i in range(bs):
-            # extract per-image predicted slices
-            q_start = i * num_queries
-            q_end = (i + 1) * num_queries
-    
-            preds_prob_i = out_prob[q_start:q_end]        # [num_queries, num_classes]
-            preds_bbox_i = out_bbox[q_start:q_end]        # [num_queries, 4]
-            preds_poly_i = out_polygon[q_start:q_end]     # [num_queries, 16]
-            preds_text_logits_i = out_text_logits[q_start:q_end]  # [num_queries, max_text_len, vocab_size]
-    
-            tgt = targets[i]
-            tgt_ids = tgt.get("labels", torch.tensor([], dtype=torch.long, device=preds_prob_i.device))
-            tgt_bbox = tgt.get("boxes", torch.empty((0, 4), device=preds_bbox_i.device))
-            tgt_poly = tgt.get("polygons", torch.empty((0, preds_poly_i.shape[1]), device=preds_poly_i.device))
-            tgt_text = tgt.get("texts", torch.empty((0, preds_text_logits_i.shape[1]), dtype=torch.long, device=preds_text_logits_i.device))
-    
-            num_targets = tgt_ids.shape[0]
-    
-            # If there are no targets in this image, return empty match
-            if num_targets == 0:
-                matches_per_image.append((torch.empty(0, dtype=torch.int64), torch.empty(0, dtype=torch.int64)))
-                continue
-    
-            # ---- Classification cost: negative log-prob of target class for each query ----
-            # preds_prob_i: [num_queries, num_classes]
-            # tgt_ids: [num_targets]
-            # result -> [num_queries, num_targets]
+            # Target values for current image
+            tgt_ids = tgt_ids_list[i]
+            tgt_bbox = tgt_bbox_list[i]
+            tgt_polygon = tgt_polygon_list[i]
+            tgt_text = tgt_text_list[i]
+            
+            # --- Classification cost ---
+            # Cost based on the negative log-probability of the predicted class.
+            # The 0-th class is considered 'no object'.
+            cost_class = -out_prob[i * num_queries : (i + 1) * num_queries, tgt_ids]
+            
+            # --- Bbox cost ---
+            # Compute the L1 cost between boxes
+            cost_bbox = torch.cdist(out_bbox[i * num_queries : (i + 1) * num_queries], tgt_bbox, p=1)
+            
+            # Compute the giou cost between boxes (IoU utils needed, see below)
+            cost_giou = -bbox_giou(box_cxcywh_to_xyxy(out_bbox[i * num_queries : (i + 1) * num_queries]),
+                                  box_cxcywh_to_xyxy(tgt_bbox))
+            
+            # --- Polygon cost (L1) ---
+            cost_polygon = torch.cdist(out_polygon[i * num_queries : (i + 1) * num_queries], tgt_polygon, p=1)
+
+            # --- Text recognition cost (Cross-Entropy) ---
+            # Initialize cost_text matrix with high value so non-recognition queries don't match text targets easily
+            cost_text_matrix_for_image = torch.full(
+                (num_queries, len(tgt_text)),
+                float('inf'), # Use 'inf' for non-text queries for matching
+                device=out_text_logits.device
+            )
+
+            if len(tgt_text) > 0:
+                # Determine which queries are actually recognition queries (the last `self.num_recognition_queries`)
+                # Only these queries will contribute to the text cost
+                rec_query_global_indices = torch.arange(
+                    num_queries - self.num_recognition_queries,
+                    num_queries,
+                    device=out_text_logits.device
+                )
+
+                for q_global_idx in rec_query_global_indices: # Iterate only over relevant recognition queries
+                    query_text_logits = out_text_logits[i * num_queries + q_global_idx] # [max_text_len, vocab_size]
+                    
+                    costs_for_this_query_vs_targets = []
+                    for t_idx in range(len(tgt_text)):
+                        target_char_ids = tgt_text[t_idx] # [max_text_len]
+                        
+                        # Calculate CE for this recognition query's predicted text against this target's text
+                        ce_loss = F.cross_entropy(query_text_logits.view(-1, query_text_logits.shape[-1]), 
+                                                target_char_ids.view(-1), 
+                                                reduction='none', ignore_index=0) # Ignore padding token 0
+                        
+                        costs_for_this_query_vs_targets.append(ce_loss.sum()) # Sum character-level losses
+                    
+                    if len(costs_for_this_query_vs_targets) > 0:
+                        # Assign the calculated costs only to the recognition query rows
+                        cost_text_matrix_for_image[q_global_idx, :] = torch.stack(costs_for_this_query_vs_targets)
+            
+            # --- Final Cost Matrix ---
+            # Use the refined cost_text_matrix_for_image here
+            C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + \
+                self.cost_giou * cost_giou + self.cost_polygon * cost_polygon + \
+                self.cost_text * cost_text_matrix_for_image # <--- USE THE NEW MATRIX HERE
+                        
+            # Use `scipy` for matching
+            import scipy.optimize
             try:
-                cost_class = -preds_prob_i[:, tgt_ids]  # broadcasting picks columns for each tgt id
-            except Exception as e:
-                # If indexing fails for dtype reasons, convert tgt_ids to cpu long numpy then index
-                tgt_ids_cpu = tgt_ids.to(torch.long).cpu().numpy()
-                cost_class = -preds_prob_i[:, tgt_ids_cpu]
-    
-            # ---- Box L1 cost ----
-            if tgt_bbox.numel() == 0:
-                cost_bbox = torch.zeros((num_queries, 0), device=preds_bbox_i.device)
-                cost_giou = torch.zeros((num_queries, 0), device=preds_bbox_i.device)
-            else:
-                # ensure finite
-                preds_bbox_i = torch.nan_to_num(preds_bbox_i, nan=0.0, posinf=1e6, neginf=-1e6)
-                tgt_bbox = torch.nan_to_num(tgt_bbox, nan=0.0, posinf=1e6, neginf=-1e6)
-    
-                cost_bbox = torch.cdist(preds_bbox_i, tgt_bbox, p=1)  # [num_queries, num_targets]
-    
-                # giou cost (negative giou to turn into a minimization)
-                try:
-                    preds_xy = box_cxcywh_to_xyxy(preds_bbox_i)
-                    tgt_xy = box_cxcywh_to_xyxy(tgt_bbox)
-                    giou = bbox_giou(preds_xy, tgt_xy)  # expected [num_queries, num_targets]
-                    cost_giou = -giou
-                except Exception:
-                    # If giou fails, use a fallback large constant (so it won't dominate)
-                    cost_giou = torch.full((num_queries, num_targets), 1e3, device=preds_bbox_i.device)
-    
-            # ---- Polygon L1 cost ----
-            if tgt_poly.numel() == 0:
-                cost_polygon = torch.zeros((num_queries, 0), device=preds_poly_i.device)
-            else:
-                preds_poly_i = torch.nan_to_num(preds_poly_i, nan=0.0, posinf=1e6, neginf=-1e6)
-                tgt_poly = torch.nan_to_num(tgt_poly, nan=0.0, posinf=1e6, neginf=-1e6)
-                cost_polygon = torch.cdist(preds_poly_i, tgt_poly, p=1)
-    
-            # ---- Text recognition cost ----
-            # Build a matrix [num_queries, num_targets] where only recognition queries have finite costs
-            LARGE_COST = 1e6
-            cost_text = torch.full((num_queries, num_targets), LARGE_COST, device=preds_text_logits_i.device)
-    
-            # recognition queries are assumed to be last `rec_q` queries of this image
-            rec_start = max(0, num_queries - rec_q)
-            rec_indices = torch.arange(rec_start, num_queries, device=preds_text_logits_i.device, dtype=torch.long)
-    
-            if tgt_text.numel() > 0:
-                # For each recognition query, compute CE against each target text (sum across tokens)
-                for rec_idx in rec_indices.tolist():
-                    query_logits = preds_text_logits_i[rec_idx]  # [max_text_len, vocab_size]
-                    # convert to shape [max_text_len, vocab] -> [max_text_len, vocab]
-                    for t_idx in range(num_targets):
-                        tgt_tokens = tgt_text[t_idx]  # [max_text_len]
-                        # ensure shapes, handle ignore_index (assumes pad index 0)
-                        try:
-                            ce = F.cross_entropy(
-                                query_logits.view(-1, query_logits.shape[-1]),
-                                tgt_tokens.view(-1),
-                                reduction='none',
-                                ignore_index=0
-                            )
-                            cost_text_val = ce.sum()
-                        except Exception:
-                            # if mismatch or other issue, set large cost
-                            cost_text_val = torch.tensor(LARGE_COST, device=preds_text_logits_i.device)
-    
-                        cost_text[rec_idx, t_idx] = cost_text_val
-    
-            # ---- Compose final cost matrix ----
-            # Weights stored on self: cost_class, cost_bbox, cost_giou, cost_polygon, cost_text
-            C = (self.cost_bbox * cost_bbox
-                 + self.cost_class * cost_class
-                 + self.cost_giou * cost_giou
-                 + self.cost_polygon * cost_polygon
-                 + self.cost_text * cost_text)
-    
-            # Ensure C is finite and a numpy 2D array for SciPy
-            C = torch.nan_to_num(C, nan=LARGE_COST, posinf=LARGE_COST, neginf=-LARGE_COST)
-            C_np = C.cpu().numpy()
-    
-            # Final safety: if any entry is inf or nan, replace
-            if not np.isfinite(C_np).all():
-                C_np = np.nan_to_num(C_np, nan=LARGE_COST, posinf=LARGE_COST, neginf=-LARGE_COST)
-    
-            # SciPy Hungarian matcher expects a 2D matrix. If shape is (num_queries, num_targets)
-            # it's fine. If any dimension is zero, return empty match.
-            if C_np.size == 0 or C_np.shape[0] == 0 or C_np.shape[1] == 0:
-                matches_per_image.append((torch.empty(0, dtype=torch.int64), torch.empty(0, dtype=torch.int64)))
-                continue
-    
-            # Try Hungarian, fallback to greedy argmin-per-target if it fails
-            try:
-                row_ind, col_ind = linear_sum_assignment(C_np)
-                row_ind = torch.as_tensor(row_ind, dtype=torch.int64)
-                col_ind = torch.as_tensor(col_ind, dtype=torch.int64)
-            except Exception as e:
-                # fallback: assign each target to argmin over queries (deterministic greedy)
-                row_ind = torch.as_tensor(np.argmin(C_np, axis=0), dtype=torch.int64)  # one query per target
-                col_ind = torch.as_tensor(np.arange(C_np.shape[1], dtype=np.int64), dtype=torch.int64)
-    
-            matches_per_image.append((row_ind, col_ind))
-    
-        return matches_per_image
+                indices = scipy.optimize.linear_sum_assignment(C.cpu())
+            except ValueError as e:
+                # Handle cases where C might have inf/nan if targets are empty or other issues
+                # Or if scipy cannot find a match
+                if "contains NaN" in str(e) or "contains infinity" in str(e) or C.shape[0] == 0 or C.shape[1] == 0:
+                    indices = (np.array([]), np.array([])) # No matches
+                else:
+                    raise e
+
+            indices = (torch.as_tensor(indices[0], dtype=torch.int64), torch.as_tensor(indices[1], dtype=torch.int64))
+            cost_matrices.append(indices)
+
+        return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in cost_matrices]
 
 # Helper functions for box transformations (usually in `util/box_ops.py` in DETR)
 def box_cxcywh_to_xyxy(x):
