@@ -472,15 +472,7 @@ class MemoryOptimizedVimTS(nn.Module):
         }
 
 class HungarianMatcher(nn.Module):
-    """This class computes an optimal bipartite matching between the predictions and targets.
-    For each image, it computes a cost matrix between all predictions and all targets.
-    The cost is a weighted sum of:
-        - negative log-likelihood for classification
-        - L1 distance for boxes
-        - GIoU loss for boxes
-        - L1 distance for polygons (new)
-        - Cross-entropy for text recognition (new)
-    """
+    """Fixed Hungarian matcher with proper handling of empty cases"""
     def __init__(self, cost_class: float = 1, cost_bbox: float = 1, cost_giou: float = 1,
                  cost_polygon: float = 1, cost_text: float = 1, num_recognition_queries: int = 25):
         super().__init__()
@@ -494,42 +486,22 @@ class HungarianMatcher(nn.Module):
 
     @torch.no_grad()
     def forward(self, outputs, targets):
-        """Performs the matching
-        Args:
-            outputs: This is a dict that contains at least these entries:
-                "pred_logits": Tensor of dim [batch_size, num_queries, num_classes] with the classification logits
-                "pred_boxes": Tensor of dim [batch_size, num_queries, 4] with the predicted box coordinates
-                "pred_polygons": Tensor of dim [batch_size, num_queries, 16] with predicted polygon coords
-                "pred_texts": Tensor of dim [batch_size, num_queries, max_text_len, vocab_size] with text logits
-            targets: This is a list of targets (len(targets) = batch_size), where each target is a dict containing:
-                "labels": Tensor of dim [num_target_boxes] (ground-truth classification labels)
-                "boxes": Tensor of dim [num_target_boxes, 4] (ground-truth box coordinates)
-                "polygons": Tensor of dim [num_target_boxes, 16] (ground-truth polygon coordinates)
-                "texts": Tensor of dim [num_target_boxes, max_text_len] (ground-truth text token IDs)
-        Returns:
-            A list of lists of tuples (pred_idx, target_idx) for each image in the batch,
-            representing the optimal matching between the predictions and target.
-        """
+        """Performs the matching with proper error handling"""
         bs, num_queries = outputs["pred_logits"].shape[:2]
 
         # We flatten to compute the cost matrices in a batch
         out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)  # [bs*num_queries, num_classes]
         out_bbox = outputs["pred_boxes"].flatten(0, 1)  # [bs*num_queries, 4]
-        out_polygon = outputs["pred_polygons"].flatten(0, 1) # [bs*num_queries, 16]
-        
-        # Only take recognition queries for text matching
-        # Assuming recognition queries are the last `num_recognition_queries`
-        num_recognition_queries = outputs["pred_texts"].shape[1] # This should be 25 from your model
-        out_text_logits = outputs["pred_texts"].flatten(0, 1) # [bs*num_queries, max_text_len, vocab_size]
-        
-        # Placeholder for target processing, will be updated in loop
+        out_polygon = outputs["pred_polygons"].flatten(0, 1)  # [bs*num_queries, 16]
+        out_text_logits = outputs["pred_texts"].flatten(0, 1)  # [bs*num_queries, max_text_len, vocab_size]
+
         tgt_ids_list = [v["labels"] for v in targets]
         tgt_bbox_list = [v["boxes"] for v in targets]
         tgt_polygon_list = [v["polygons"] for v in targets]
         tgt_text_list = [v["texts"] for v in targets]
 
-        # Costs per image
-        cost_matrices = []
+        indices = []
+        
         for i in range(bs):
             # Target values for current image
             tgt_ids = tgt_ids_list[i]
@@ -537,138 +509,99 @@ class HungarianMatcher(nn.Module):
             tgt_polygon = tgt_polygon_list[i]
             tgt_text = tgt_text_list[i]
             
+            num_targets = len(tgt_ids)
+            
+            # If no targets, match nothing
+            if num_targets == 0:
+                indices.append((torch.tensor([], dtype=torch.int64, device=out_prob.device), 
+                              torch.tensor([], dtype=torch.int64, device=out_prob.device)))
+                continue
+
             # --- Classification cost ---
-            # Cost based on the negative log-probability of the predicted class.
-            # The 0-th class is considered 'no object'.
-            cost_class = -out_prob[i * num_queries : (i + 1) * num_queries, tgt_ids]
-            
+            # Get predictions for this batch item
+            out_prob_i = out_prob[i * num_queries:(i + 1) * num_queries]
+            cost_class = -out_prob_i[:, tgt_ids]  # [num_queries, num_targets]
+
             # --- Bbox cost ---
-            # Compute the L1 cost between boxes
-            cost_bbox = torch.cdist(out_bbox[i * num_queries : (i + 1) * num_queries], tgt_bbox, p=1)
-            
-            # Compute the giou cost between boxes (IoU utils needed, see below)
-            cost_giou = -bbox_giou(box_cxcywh_to_xyxy(out_bbox[i * num_queries : (i + 1) * num_queries]),
-                                  box_cxcywh_to_xyxy(tgt_bbox))
-            
-            # --- Polygon cost (L1) ---
-            cost_polygon = torch.cdist(out_polygon[i * num_queries : (i + 1) * num_queries], tgt_polygon, p=1)
+            out_bbox_i = out_bbox[i * num_queries:(i + 1) * num_queries]
+            cost_bbox = torch.cdist(out_bbox_i, tgt_bbox, p=1)  # [num_queries, num_targets]
 
-            # --- Text recognition cost (Cross-Entropy) ---
-            # Initialize cost_text matrix with high value so non-recognition queries don't match text targets easily
-            cost_text_matrix_for_image = torch.full(
-                (num_queries, len(tgt_text)),
-                float('inf'), # Use 'inf' for non-text queries for matching
-                device=out_text_logits.device
+            # --- GIoU cost ---
+            cost_giou = -generalized_box_iou(
+                box_cxcywh_to_xyxy(out_bbox_i),
+                box_cxcywh_to_xyxy(tgt_bbox)
+            )  # [num_queries, num_targets]
+
+            # --- Polygon cost ---
+            out_polygon_i = out_polygon[i * num_queries:(i + 1) * num_queries]
+            cost_polygon = torch.cdist(out_polygon_i, tgt_polygon, p=1)  # [num_queries, num_targets]
+
+            # --- Text recognition cost ---
+            cost_text = torch.zeros(num_queries, num_targets, device=out_prob.device)
+            
+            # Only compute text cost for recognition queries
+            rec_query_indices = torch.arange(
+                num_queries - self.num_recognition_queries, 
+                num_queries,
+                device=out_prob.device
             )
-
-            if len(tgt_text) > 0:
-                # Determine which queries are actually recognition queries (the last `self.num_recognition_queries`)
-                # Only these queries will contribute to the text cost
-                rec_query_global_indices = torch.arange(
-                    num_queries - self.num_recognition_queries,
-                    num_queries,
-                    device=out_text_logits.device
-                )
-
-                for q_global_idx in rec_query_global_indices: # Iterate only over relevant recognition queries
-                    query_text_logits = out_text_logits[i * num_queries + q_global_idx] # [max_text_len, vocab_size]
-                    
-                    costs_for_this_query_vs_targets = []
-                    for t_idx in range(len(tgt_text)):
-                        target_char_ids = tgt_text[t_idx] # [max_text_len]
-                        
-                        # Calculate CE for this recognition query's predicted text against this target's text
-                        ce_loss = F.cross_entropy(query_text_logits.view(-1, query_text_logits.shape[-1]), 
-                                                target_char_ids.view(-1), 
-                                                reduction='none', ignore_index=0) # Ignore padding token 0
-                        
-                        costs_for_this_query_vs_targets.append(ce_loss.sum()) # Sum character-level losses
-                    
-                    if len(costs_for_this_query_vs_targets) > 0:
-                        # Assign the calculated costs only to the recognition query rows
-                        cost_text_matrix_for_image[q_global_idx, :] = torch.stack(costs_for_this_query_vs_targets)
             
-            # --- Final Cost Matrix ---
-            # Use the refined cost_text_matrix_for_image here
-            C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + \
-                self.cost_giou * cost_giou + self.cost_polygon * cost_polygon + \
-                self.cost_text * cost_text_matrix_for_image # <--- USE THE NEW MATRIX HERE
+            if len(tgt_text) > 0:
+                for q_idx in rec_query_indices:
+                    query_text_logits = out_text_logits[i * num_queries + q_idx]  # [max_text_len, vocab_size]
+                    
+                    for t_idx in range(num_targets):
+                        target_text = tgt_text[t_idx]  # [max_text_len]
                         
-            import scipy.optimize
-            import numpy as np
+                        # Calculate cross-entropy loss
+                        ce_loss = F.cross_entropy(
+                            query_text_logits.view(-1, query_text_logits.shape[-1]),
+                            target_text.view(-1),
+                            reduction='none',
+                            ignore_index=0  # ignore padding
+                        )
+                        
+                        # Sum over non-padding tokens
+                        valid_tokens = (target_text != 0).sum()
+                        if valid_tokens > 0:
+                            cost_text[q_idx, t_idx] = ce_loss.sum() / valid_tokens
+                        else:
+                            cost_text[q_idx, t_idx] = 10.0  # High cost for empty text
 
-            # Handle cases where C might be empty or contain invalid values
-            if C.numel() == 0 or C.shape[1] == 0 or C.shape[0] == 0:
-                indices = (np.array([]), np.array([]))
-            else:
-                # Replace inf/nan with large finite values for feasibility
-                C_clean = C.clone()
-                C_clean = torch.where(torch.isfinite(C_clean), C_clean, torch.tensor(1e8, device=C.device))
-                
-                try:
-                    indices = scipy.optimize.linear_sum_assignment(C_clean.cpu().numpy())
-                except ValueError as e:
-                    print(f"[WARNING] Matching failed at batch {i}: {e}")
-                    print(f"Cost matrix shape: {C.shape}, contains inf: {torch.isinf(C).any()}, contains nan: {torch.isnan(C).any()}")
-                    indices = (np.array([]), np.array([]))
-                    cost_matrices.append(indices)
+            # For non-recognition queries, set high text cost to discourage matching
+            non_rec_mask = torch.ones(num_queries, num_targets, device=out_prob.device, dtype=torch.bool)
+            non_rec_mask[rec_query_indices] = False
+            cost_text[non_rec_mask] = 10.0  # High cost
 
-        return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in cost_matrices]
+            # --- Final Cost Matrix ---
+            C = (self.cost_class * cost_class + 
+                 self.cost_bbox * cost_bbox + 
+                 self.cost_giou * cost_giou + 
+                 self.cost_polygon * cost_polygon + 
+                 self.cost_text * cost_text)
 
-# Helper functions for box transformations (usually in `util/box_ops.py` in DETR)
-def box_cxcywh_to_xyxy(x):
-    x_c, y_c, w, h = x.unbind(-1)
-    b = [(x_c - 0.5 * w), (y_c - 0.5 * h),
-         (x_c + 0.5 * w), (y_c + 0.5 * h)]
-    return torch.stack(b, dim=-1)
+            # Hungarian matching
+            try:
+                C_np = C.cpu().numpy()
+                row_ind, col_ind = scipy.optimize.linear_sum_assignment(C_np)
+                indices.append((torch.as_tensor(row_ind, dtype=torch.int64, device=out_prob.device),
+                              torch.as_tensor(col_ind, dtype=torch.int64, device=out_prob.device)))
+            except Exception as e:
+                print(f"Warning: Hungarian matching failed for batch {i}: {e}")
+                # Fallback: match first N targets with first N queries
+                min_len = min(num_queries, num_targets)
+                row_ind = torch.arange(min_len, device=out_prob.device)
+                col_ind = torch.arange(min_len, device=out_prob.device)
+                indices.append((row_ind, col_ind))
 
-def box_iou(boxes1, boxes2):
-    area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
-    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
-
-    lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])  # [N,M,2]
-    rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])  # [N,M,2]
-
-    wh = (rb - lt).clamp(min=0)  # [N,M,2]
-    inter = wh[:, :, 0] * wh[:, :, 1]  # [N,M]
-
-    union = area1[:, None] + area2 - inter
-
-    iou = inter / (union + 1e-6)
-    return iou, union
-
-def generalized_box_iou(boxes1, boxes2):
-    """
-    Generalized IoU from https://giou.stanford.edu/
-    The boxes should be in [x0, y0, x1, y1] format.
-    Returns a [N, M] pairwise matrix, where N = len(boxes1)
-    and M = len(boxes2)
-    """
-    assert (boxes1[:, 2:] >= boxes1[:, :2]).all()
-    assert (boxes2[:, 2:] >= boxes2[:, :2]).all()
-    iou, union = box_iou(boxes1, boxes2)
-
-    lt = torch.min(boxes1[:, None, :2], boxes2[:, :2])
-    rb = torch.max(boxes1[:, None, 2:], boxes2[:, 2:])
-
-    wh = (rb - lt).clamp(min=0)
-    area = wh[:, :, 0] * wh[:, :, 1]
-
-    return iou - (area - union) / (area + 1e-6)
-
-def bbox_giou(boxes1, boxes2):
-    """
-    Wrapper for generalized_box_iou
-    """
-    giou = generalized_box_iou(boxes1, boxes2)
-    return giou
+        return indices
 
 # ============================================================================
 # 6. LOSS FUNCTION (UPDATED)
 # ============================================================================
 
 class VimTSLoss(nn.Module):
-    """Loss function with Hungarian matching, similar to DETR."""
+    """Fixed loss function with proper empty target handling"""
     def __init__(self, matcher, num_classes=2, max_text_len=25, vocab_size=100, 
                  losses=['labels', 'boxes', 'polygons', 'texts'],
                  weight_class=2.0, weight_bbox=5.0, weight_giou=2.0, 
@@ -687,146 +620,154 @@ class VimTSLoss(nn.Module):
         self.weight_polygon = weight_polygon
         self.weight_text = weight_text
 
-        # Background class is num_classes (e.g., if num_classes=2, then classes are 0, 1, and 2 is background)
+        # Background class is num_classes
         empty_weight = torch.ones(self.num_classes + 1)
-        empty_weight[self.num_classes] = 0.1 # Lower weight for background class
+        empty_weight[self.num_classes] = 0.1
         self.register_buffer('empty_weight', empty_weight)
 
     def forward(self, predictions, targets):
-        """Compute loss with Hungarian matching."""
+        """Compute loss with proper empty target handling"""
         
-        # Ensure 'pred_texts' is adjusted for recognition queries
-        # Model returns full_text_logits, which already has padding for non-recognition queries
-        
-        # Compute the matched indices between predictions and targets
-        # The matcher expects [bs, num_queries, ...] but pred_texts is [bs, num_queries, max_len, vocab_size]
-        # We need to pass enough info for text matching.
+        # Compute the matched indices
         indices = self.matcher(predictions, targets)
         
         # Calculate individual losses
         loss_dict = {}
         
-        # Class loss
-        loss_labels = self.loss_labels(predictions, targets, indices)
-        loss_dict.update(loss_labels)
+        if 'labels' in self.losses:
+            loss_labels = self.loss_labels(predictions, targets, indices)
+            loss_dict.update(loss_labels)
         
-        # Bbox and GIoU loss
-        loss_boxes = self.loss_boxes(predictions, targets, indices)
-        loss_dict.update(loss_boxes)
+        if 'boxes' in self.losses:
+            loss_boxes = self.loss_boxes(predictions, targets, indices)
+            loss_dict.update(loss_boxes)
         
-        # Polygon loss
-        loss_polygons = self.loss_polygons(predictions, targets, indices)
-        loss_dict.update(loss_polygons)
+        if 'polygons' in self.losses:
+            loss_polygons = self.loss_polygons(predictions, targets, indices)
+            loss_dict.update(loss_polygons)
         
-        # Text recognition loss
-        loss_texts = self.loss_texts(predictions, targets, indices)
-        loss_dict.update(loss_texts)
+        if 'texts' in self.losses:
+            loss_texts = self.loss_texts(predictions, targets, indices)
+            loss_dict.update(loss_texts)
         
         # Combine losses
-        total_loss = (self.weight_class * loss_dict['loss_ce'] +
-                      self.weight_bbox * loss_dict['loss_bbox'] +
-                      self.weight_giou * loss_dict['loss_giou'] +
-                      self.weight_polygon * loss_dict['loss_polygon'] +
-                      self.weight_text * loss_dict['loss_text'])
-        
+        total_loss = sum(loss_dict.values())
         loss_dict['total_loss'] = total_loss
         
         return total_loss, loss_dict
 
     def _get_src_permutation_idx(self, indices):
-        # permute predictions following indices
-        batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
-        src_idx = torch.cat([src for (src, _) in indices])
-        return batch_idx, src_idx
+        """Get source permutation indices with empty handling"""
+        batch_idx = []
+        src_idx = []
+        
+        for i, (src, _) in enumerate(indices):
+            if len(src) > 0:
+                batch_idx.append(torch.full_like(src, i))
+                src_idx.append(src)
+        
+        if len(batch_idx) == 0:
+            return torch.tensor([], dtype=torch.int64), torch.tensor([], dtype=torch.int64)
+        
+        return torch.cat(batch_idx), torch.cat(src_idx)
 
     def _get_tgt_permutation_idx(self, indices):
-        # permute targets following indices
-        batch_idx = torch.cat([torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)])
-        tgt_idx = torch.cat([tgt for (_, tgt) in indices])
-        return batch_idx, tgt_idx
+        """Get target permutation indices with empty handling"""
+        batch_idx = []
+        tgt_idx = []
+        
+        for i, (_, tgt) in enumerate(indices):
+            if len(tgt) > 0:
+                batch_idx.append(torch.full_like(tgt, i))
+                tgt_idx.append(tgt)
+        
+        if len(batch_idx) == 0:
+            return torch.tensor([], dtype=torch.int64), torch.tensor([], dtype=torch.int64)
+        
+        return torch.cat(batch_idx), torch.cat(tgt_idx)
 
     def loss_labels(self, outputs, targets, indices):
-        """Classification loss (NLL)
-        targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
-        """
+        """Classification loss with empty handling"""
         assert 'pred_logits' in outputs
-        src_logits = outputs['pred_logits'] # [B, N, num_classes+1]
+        src_logits = outputs['pred_logits']  # [B, N, num_classes+1]
 
         idx = self._get_src_permutation_idx(indices)
-        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-        # All unmatched queries are assigned to the background class
         target_classes = torch.full(src_logits.shape[:2], self.num_classes,
                                     dtype=torch.int64, device=src_logits.device)
-        target_classes[idx] = target_classes_o
+        
+        if len(idx[0]) > 0:
+            target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+            target_classes[idx] = target_classes_o
 
         loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
-        losses = {'loss_ce': loss_ce}
-        return losses
+        return {'loss_ce': loss_ce}
 
     def loss_boxes(self, outputs, targets, indices):
-        """Compute the losses related to the bounding boxes, the L1 and GIoU loss.
-           targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
-           The target boxes are expected in format (x_center, y_center, w, h).
-        """
+        """Bounding box losses with empty handling"""
         assert 'pred_boxes' in outputs
         idx = self._get_src_permutation_idx(indices)
         
-        src_boxes = outputs['pred_boxes'][idx] # Matched predicted boxes
-        target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0) # Matched target boxes
+        if len(idx[0]) == 0:
+            return {'loss_bbox': torch.tensor(0.0, device=outputs['pred_boxes'].device),
+                    'loss_giou': torch.tensor(0.0, device=outputs['pred_boxes'].device)}
+        
+        src_boxes = outputs['pred_boxes'][idx]
+        target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
 
-        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
+        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='sum')
+        num_boxes = len(src_boxes)
+        loss_bbox = loss_bbox / num_boxes if num_boxes > 0 else loss_bbox
 
-        losses = {}
-        losses['loss_bbox'] = loss_bbox.sum() / len(src_boxes) if len(src_boxes) > 0 else loss_bbox.sum()
-
-        # GIoU loss (requires boxes in x_min, y_min, x_max, y_max format)
+        # GIoU loss
         src_boxes_xyxy = box_cxcywh_to_xyxy(src_boxes)
         target_boxes_xyxy = box_cxcywh_to_xyxy(target_boxes)
-        
-        loss_giou = 1 - torch.diag(bbox_giou(src_boxes_xyxy, target_boxes_xyxy))
-        losses['loss_giou'] = loss_giou.sum() / len(src_boxes) if len(src_boxes) > 0 else loss_giou.sum()
-        return losses
+        giou_loss = 1 - torch.diag(generalized_box_iou(src_boxes_xyxy, target_boxes_xyxy))
+        loss_giou = giou_loss.sum() / num_boxes if num_boxes > 0 else giou_loss.sum()
+
+        return {'loss_bbox': loss_bbox, 'loss_giou': loss_giou}
 
     def loss_polygons(self, outputs, targets, indices):
-        """Compute the L1 loss for polygons."""
+        """Polygon loss with empty handling"""
         assert 'pred_polygons' in outputs
         idx = self._get_src_permutation_idx(indices)
         
-        src_polygons = outputs['pred_polygons'][idx] # Matched predicted polygons
-        target_polygons = torch.cat([t['polygons'][i] for t, (_, i) in zip(targets, indices)], dim=0) # Matched target polygons
+        if len(idx[0]) == 0:
+            return {'loss_polygon': torch.tensor(0.0, device=outputs['pred_polygons'].device)}
+        
+        src_polygons = outputs['pred_polygons'][idx]
+        target_polygons = torch.cat([t['polygons'][i] for t, (_, i) in zip(targets, indices)], dim=0)
 
-        loss_polygon = F.l1_loss(src_polygons, target_polygons, reduction='none')
-        losses = {}
-        losses['loss_polygon'] = loss_polygon.sum() / len(src_polygons) if len(src_polygons) > 0 else loss_polygon.sum()
-        return losses
+        loss_polygon = F.l1_loss(src_polygons, target_polygons, reduction='sum')
+        num_polygons = len(src_polygons)
+        loss_polygon = loss_polygon / num_polygons if num_polygons > 0 else loss_polygon
+
+        return {'loss_polygon': loss_polygon}
 
     def loss_texts(self, outputs, targets, indices):
-        """Compute the Cross-Entropy loss for text recognition."""
+        """Text recognition loss with empty handling"""
         assert 'pred_texts' in outputs
-        
         idx = self._get_src_permutation_idx(indices)
         
-        src_texts_logits = outputs['pred_texts'][idx] # [num_matched_queries, max_text_len, vocab_size]
-        target_texts = torch.cat([t['texts'][i] for t, (_, i) in zip(targets, indices)], dim=0) # [num_matched_queries, max_text_len]
+        if len(idx[0]) == 0:
+            return {'loss_text': torch.tensor(0.0, device=outputs['pred_texts'].device)}
+        
+        src_texts_logits = outputs['pred_texts'][idx]
+        target_texts = torch.cat([t['texts'][i] for t, (_, i) in zip(targets, indices)], dim=0)
 
-        if len(src_texts_logits) == 0:
-            return {'loss_text': torch.tensor(0.0, device=src_texts_logits.device)}
-
-        # Flatten for F.cross_entropy
+        # Flatten for cross entropy
         src_texts_logits_flat = src_texts_logits.view(-1, self.vocab_size)
         target_texts_flat = target_texts.view(-1)
         
-        # Ignore padding token (assume 0 is padding)
+        # Ignore padding tokens
         mask = target_texts_flat != 0
         
         if mask.sum() == 0:
             loss_text = torch.tensor(0.0, device=src_texts_logits.device)
         else:
             loss_text = F.cross_entropy(src_texts_logits_flat[mask], target_texts_flat[mask], reduction='sum')
-            loss_text = loss_text / mask.sum() # Average over non-padding tokens
+            loss_text = loss_text / mask.sum()
 
-        losses = {'loss_text': loss_text}
-        return losses
+        return {'loss_text': loss_text}
     
 def collate_fn(batch):
     """Custom collate function for batching"""
@@ -1053,20 +994,9 @@ def setup_training():
 # ============================================================================
 # 9. TRAINING SCRIPT
 # ============================================================================
-
 def train_vimts(dataset_path, num_epochs=10, batch_size=1, learning_rate=1e-4,
                 gradient_accumulation_steps=4, save_path="/content/drive/MyDrive/"):
-    """
-    Complete training function for VimTS
-    
-    Args:
-        dataset_path: Path to dataset directory
-        num_epochs: Number of training epochs
-        batch_size: Batch size (keep small for T4)
-        learning_rate: Learning rate
-        gradient_accumulation_steps: Steps to accumulate gradients
-        save_path: Path to save checkpoints
-    """
+    """Training function with debugging and error handling"""
     
     print("=" * 60)
     print("Starting VimTS Training with Memory Optimization")
@@ -1082,16 +1012,16 @@ def train_vimts(dataset_path, num_epochs=10, batch_size=1, learning_rate=1e-4,
     train_dataset = VimTSDataset(
         dataset_path=dataset_path,
         split='train',
-        image_size=(640, 640),  # Keep original resolution for accuracy
+        image_size=(640, 640),
         max_text_len=25,
-        vocab_size=100
+        vocab_size=96  # Fixed to match actual vocabulary
     )
     
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=2,
+        num_workers=0,  # Reduce workers to avoid issues
         collate_fn=collate_fn,
         pin_memory=True if torch.cuda.is_available() else False
     )
@@ -1099,11 +1029,22 @@ def train_vimts(dataset_path, num_epochs=10, batch_size=1, learning_rate=1e-4,
     print(f"Dataset size: {len(train_dataset)}")
     print(f"Batches per epoch: {len(train_loader)}")
     
-    # Create model (ensure num_classes is 1 for a single 'text' positive class)
+    # Debug: Check first batch
+    print("\nDebug: Checking first batch...")
+    for images, targets in train_loader:
+        print(f"Images shape: {images.shape}")
+        print(f"Number of targets: {len(targets)}")
+        for i, target in enumerate(targets):
+            print(f"  Target {i}:")
+            for key, value in target.items():
+                print(f"    {key}: {value.shape if isinstance(value, torch.Tensor) else value}")
+        break
+    
+    # Create model
     print("\nInitializing model...")
     model = MemoryOptimizedVimTS(
-        num_classes=1, # This defines positive classes (e.g., just 'text'). Background is num_classes+1.
-        vocab_size=96, # Adjust based on your actual character set
+        num_classes=1,  # Only text class
+        vocab_size=96,  # Match dataset vocabulary
         max_text_len=25
     ).to(device)
     
@@ -1114,20 +1055,19 @@ def train_vimts(dataset_path, num_epochs=10, batch_size=1, learning_rate=1e-4,
     print(f"Trainable parameters: {trainable_params:,}")
     
     # Loss and optimizer
-    # Initialize the matcher, passing the correct num_recognition_queries from the model
     matcher = HungarianMatcher(
-        cost_class=1,  # You can tune these weights
+        cost_class=1,
         cost_bbox=5,
         cost_giou=2,
         cost_polygon=1,
         cost_text=1,
-        num_recognition_queries=model.num_recognition_queries # <--- PASS THIS VALUE
-    ).to(device)
+        num_recognition_queries=model.num_recognition_queries
+    )
 
     criterion = VimTSLoss(
         matcher=matcher,
-        num_classes=1, # Match model's positive class count
-        vocab_size=96, # Match model's vocab size
+        num_classes=1,
+        vocab_size=96,
         max_text_len=25,
         weight_class=2.0,
         weight_bbox=5.0,
@@ -1167,15 +1107,23 @@ def train_vimts(dataset_path, num_epochs=10, batch_size=1, learning_rate=1e-4,
             try:
                 # Move to device
                 images = images.to(device, non_blocking=True)
-                targets = [{k: v.to(device, non_blocking=True) for k, v in target.items()} 
-                          for target in targets]
+                targets = [{k: v.to(device) for k, v in target.items()} for target in targets]
+                
+                # Debug first batch
+                if batch_idx == 0 and epoch == 0:
+                    print("\nDebug first batch:")
+                    print(f"Images device: {images.device}, shape: {images.shape}")
+                    for i, target in enumerate(targets):
+                        print(f"Target {i}:")
+                        for key, value in target.items():
+                            print(f"  {key}: {value.shape if isinstance(value, torch.Tensor) else value}")
                 
                 # Forward pass with mixed precision
                 if scaler is not None:
                     with torch.cuda.amp.autocast():
                         predictions = model(images)
                         loss, loss_dict = criterion(predictions, targets)
-                        loss = loss / gradient_accumulation_steps  # Scale loss
+                        loss = loss / gradient_accumulation_steps
                 else:
                     predictions = model(images)
                     loss, loss_dict = criterion(predictions, targets)
@@ -1187,7 +1135,7 @@ def train_vimts(dataset_path, num_epochs=10, batch_size=1, learning_rate=1e-4,
                 else:
                     loss.backward()
                 
-                # Update weights every gradient_accumulation_steps
+                # Update weights
                 if (batch_idx + 1) % gradient_accumulation_steps == 0:
                     if scaler is not None:
                         scaler.unscale_(optimizer)
@@ -1208,7 +1156,7 @@ def train_vimts(dataset_path, num_epochs=10, batch_size=1, learning_rate=1e-4,
                     'Loss': f'{loss.item() * gradient_accumulation_steps:.4f}',
                     'Avg': f'{np.mean(epoch_losses):.4f}',
                     'LR': f'{optimizer.param_groups[0]["lr"]:.2e}',
-                    'GPU': f'{get_memory_usage()["allocated_gb"]:.1f}GB'
+                    'GPU': f'{get_memory_usage().get("allocated_gb", 0):.1f}GB'
                 })
                 
                 # Clear memory periodically
@@ -1223,10 +1171,11 @@ def train_vimts(dataset_path, num_epochs=10, batch_size=1, learning_rate=1e-4,
                     optimizer.zero_grad()
                     continue
                 else:
+                    print(f"Error at batch {batch_idx}: {e}")
                     raise e
         
         # Epoch summary
-        avg_loss = np.mean(epoch_losses)
+        avg_loss = np.mean(epoch_losses) if epoch_losses else 0.0
         train_losses.append(avg_loss)
         
         print(f"\nEpoch {epoch+1}/{num_epochs} Summary:")
