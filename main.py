@@ -678,9 +678,21 @@ class VimTSLoss(nn.Module):
 
     def forward(self, predictions, targets):
         """Compute loss with proper empty target handling"""
-        
+        # Validate targets
+        for i, t in enumerate(targets):
+            if not all(k in t for k in ['labels', 'boxes', 'polygons', 'texts']):
+                print(f"Warning: Invalid target at index {i}: {t.keys()}")
+                t['labels'] = torch.zeros(0, dtype=torch.long, device=predictions['pred_logits'].device)
+                t['boxes'] = torch.zeros(0, 4, dtype=torch.float, device=predictions['pred_logits'].device)
+                t['polygons'] = torch.zeros(0, 16, dtype=torch.float, device=predictions['pred_logits'].device)
+                t['texts'] = torch.zeros(0, self.max_text_len, dtype=torch.long, device=predictions['pred_logits'].device)
+
         # Compute the matched indices
         indices = self.matcher(predictions, targets)
+        
+        # Debug indices
+        if not indices:
+            print("Warning: Matcher returned empty indices list")
         
         # Calculate individual losses
         loss_dict = {}
@@ -701,8 +713,8 @@ class VimTSLoss(nn.Module):
             loss_texts = self.loss_texts(predictions, targets, indices)
             loss_dict.update(loss_texts)
         
-        # Combine losses
-        total_loss = sum(loss_dict.values())
+        # Combine losses with weights
+        total_loss = sum(loss_dict[k] * getattr(self, f'weight_{k.split("_")[1]}') for k in loss_dict if k != 'total_loss')
         loss_dict['total_loss'] = total_loss
         
         return total_loss, loss_dict
@@ -711,31 +723,41 @@ class VimTSLoss(nn.Module):
         """Get source permutation indices with empty handling"""
         batch_idx = []
         src_idx = []
+        device = next(self.parameters()).device
         
         for i, (src, _) in enumerate(indices):
-            if len(src) > 0:
-                batch_idx.append(torch.full_like(src, i))
+            if len(src) > 0 and src.isfinite().all():
+                batch_idx.append(torch.full_like(src, i, device=device))
                 src_idx.append(src)
         
-        if len(batch_idx) == 0:
-            return torch.tensor([], dtype=torch.int64), torch.tensor([], dtype=torch.int64)
+        if not batch_idx:
+            return torch.tensor([], dtype=torch.int64, device=device), torch.tensor([], dtype=torch.int64, device=device)
         
-        return torch.cat(batch_idx), torch.cat(src_idx)
+        try:
+            return torch.cat(batch_idx), torch.cat(src_idx)
+        except RuntimeError as e:
+            print(f"Error in _get_src_permutation_idx: {e}")
+            return torch.tensor([], dtype=torch.int64, device=device), torch.tensor([], dtype=torch.int64, device=device)
 
     def _get_tgt_permutation_idx(self, indices):
         """Get target permutation indices with empty handling"""
         batch_idx = []
         tgt_idx = []
+        device = next(self.parameters()).device
         
         for i, (_, tgt) in enumerate(indices):
-            if len(tgt) > 0:
-                batch_idx.append(torch.full_like(tgt, i))
+            if len(tgt) > 0 and tgt.isfinite().all():
+                batch_idx.append(torch.full_like(tgt, i, device=device))
                 tgt_idx.append(tgt)
         
-        if len(batch_idx) == 0:
-            return torch.tensor([], dtype=torch.int64), torch.tensor([], dtype=torch.int64)
+        if not batch_idx:
+            return torch.tensor([], dtype=torch.int64, device=device), torch.tensor([], dtype=torch.int64, device=device)
         
-        return torch.cat(batch_idx), torch.cat(tgt_idx)
+        try:
+            return torch.cat(batch_idx), torch.cat(tgt_idx)
+        except RuntimeError as e:
+            print(f"Error in _get_tgt_permutation_idx: {e}")
+            return torch.tensor([], dtype=torch.int64, device=device), torch.tensor([], dtype=torch.int64, device=device)
 
     def loss_labels(self, outputs, targets, indices):
         """Classification loss with empty handling"""
@@ -747,8 +769,13 @@ class VimTSLoss(nn.Module):
                                     dtype=torch.int64, device=src_logits.device)
         
         if len(idx[0]) > 0:
-            target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-            target_classes[idx] = target_classes_o
+            target_classes_o = []
+            for t, (_, J) in zip(targets, indices):
+                if len(J) > 0:
+                    target_classes_o.append(t["labels"][J])
+            if target_classes_o:
+                target_classes_o = torch.cat(target_classes_o)
+                target_classes[idx] = target_classes_o
 
         loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
         return {'loss_ce': loss_ce}
@@ -763,7 +790,11 @@ class VimTSLoss(nn.Module):
                     'loss_giou': torch.tensor(0.0, device=outputs['pred_boxes'].device)}
         
         src_boxes = outputs['pred_boxes'][idx]
-        target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices) if len(i) > 0], dim=0)
+
+        if len(src_boxes) == 0 or len(target_boxes) == 0:
+            return {'loss_bbox': torch.tensor(0.0, device=outputs['pred_boxes'].device),
+                    'loss_giou': torch.tensor(0.0, device=outputs['pred_boxes'].device)}
 
         loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='sum')
         num_boxes = len(src_boxes)
@@ -786,7 +817,10 @@ class VimTSLoss(nn.Module):
             return {'loss_polygon': torch.tensor(0.0, device=outputs['pred_polygons'].device)}
         
         src_polygons = outputs['pred_polygons'][idx]
-        target_polygons = torch.cat([t['polygons'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        target_polygons = torch.cat([t['polygons'][i] for t, (_, i) in zip(targets, indices) if len(i) > 0], dim=0)
+
+        if len(src_polygons) == 0 or len(target_polygons) == 0:
+            return {'loss_polygon': torch.tensor(0.0, device=outputs['pred_polygons'].device)}
 
         loss_polygon = F.l1_loss(src_polygons, target_polygons, reduction='sum')
         num_polygons = len(src_polygons)
@@ -803,7 +837,10 @@ class VimTSLoss(nn.Module):
             return {'loss_text': torch.tensor(0.0, device=outputs['pred_texts'].device)}
         
         src_texts_logits = outputs['pred_texts'][idx]
-        target_texts = torch.cat([t['texts'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        target_texts = torch.cat([t['texts'][i] for t, (_, i) in zip(targets, indices) if len(i) > 0], dim=0)
+
+        if len(src_texts_logits) == 0 or len(target_texts) == 0:
+            return {'loss_text': torch.tensor(0.0, device=outputs['pred_texts'].device)}
 
         # Flatten for cross entropy
         src_texts_logits_flat = src_texts_logits.view(-1, self.vocab_size)
@@ -819,45 +856,30 @@ class VimTSLoss(nn.Module):
             loss_text = loss_text / mask.sum()
 
         return {'loss_text': loss_text}
-    
-def collate_fn(batch):
-    """Custom collate function for batching"""
-    images, targets = zip(*batch)
-    
-    # Stack images
-    images = torch.stack(images, dim=0)
-    
-    # Keep targets as list
-    return images, list(targets)
-
 
 # ============================================================================
 # 7. DATASET LOADING
 # ============================================================================
 
 class VimTSDataset(Dataset):
-    """VimTS Dataset with memory-efficient loading"""
+    """VimTS Dataset with memory-efficient loading and robust annotation handling"""
     def __init__(self, dataset_path, split='train', image_size=(640, 640), 
                  max_text_len=25, vocab_size=100):
         self.dataset_path = dataset_path
         self.split = split
         self.image_size = image_size
         self.max_text_len = max_text_len
-        self.vocab_size = vocab_size # Keep this as 96 (or actual character count)
-        self.padding_token_id = 0 # Define padding token ID
-        self.unk_token_id = 1 # Define unknown token ID (or any other non-zero)
+        self.vocab_size = vocab_size
+        self.padding_token_id = 0
+        self.unk_token_id = 1
 
-        # Example character mapping (this needs to be comprehensive for your dataset)
-        # You should generate this based on your dataset's characters
+        # Character mapping
         self.char_list = sorted(list(
             "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~ "))
-        self.char_to_id = {char: i + 2 for i, char in enumerate(self.char_list)} # Start from 2 (0=PAD, 1=UNK)
+        self.char_to_id = {char: i + 2 for i, char in enumerate(self.char_list)}
         self.id_to_char = {i + 2: char for i, char in enumerate(self.char_list)}
         self.char_to_id['<pad>'] = self.padding_token_id
         self.char_to_id['<unk>'] = self.unk_token_id
-        
-        # Assert that vocab_size matches len(self.char_list) + 2 (PAD and UNK)
-        # Or, if vocab_size is fixed, map characters beyond that to UNK.
         
         # Paths
         self.annotation_file = os.path.join(dataset_path, 'totaltext', f'{split}.json')
@@ -865,16 +887,20 @@ class VimTSDataset(Dataset):
         
         # Load annotations
         print(f"Loading {split} annotations from {self.annotation_file}")
-        with open(self.annotation_file, 'r') as f:
-            coco_data = json.load(f)
+        try:
+            with open(self.annotation_file, 'r') as f:
+                coco_data = json.load(f)
+        except Exception as e:
+            print(f"Error loading annotation file: {e}")
+            coco_data = {'images': [], 'annotations': []}
         
         # Create image ID to filename mapping
-        self.images = {img['id']: img['file_name'] for img in coco_data['images']}
+        self.images = {img['id']: img['file_name'] for img in coco_data.get('images', [])}
         
         # Group annotations by image
         self.image_to_annotations = {}
-        for ann in coco_data['annotations']:
-            img_id = ann['image_id']
+        for ann in coco_data.get('annotations', []):
+            img_id = ann.get('image_id')
             if img_id not in self.image_to_annotations:
                 self.image_to_annotations[img_id] = []
             self.image_to_annotations[img_id].append(ann)
@@ -905,7 +931,6 @@ class VimTSDataset(Dataset):
             image = self.transform(image)
         except Exception as e:
             print(f"Error loading image {image_path}: {e}")
-            # Create dummy image
             image = torch.randn(3, *self.image_size)
             original_w, original_h = self.image_size
         
@@ -919,28 +944,31 @@ class VimTSDataset(Dataset):
         texts = []
         
         for ann in annotations:
-            # Label (category_id)
-            # labels.append(ann.get('category_id', 1))
+            # Validate annotation
+            if 'bbox' not in ann or 'rec' not in ann:
+                print(f"Warning: Invalid annotation for image {image_id}: {ann}")
+                continue
             
-            # Bounding box - normalize to [0, 1]
+            # Bounding box - normalize to [0, 1] and convert to cxcywh
             x, y, w, h = ann['bbox']
-            norm_box = [
-                x / original_w,
-                y / original_h, 
-                w / original_w,
-                h / original_h
-            ]
+            if w <= 0 or h <= 0:
+                print(f"Warning: Invalid bbox dimensions for image {image_id}: {ann['bbox']}")
+                continue
+            cx = (x + w / 2) / original_w
+            cy = (y + h / 2) / original_h
+            norm_w = w / original_w
+            norm_h = h / original_h
+            norm_box = [cx, cy, norm_w, norm_h]
             boxes.append(norm_box)
             
             # Polygon
             if 'segmentation' in ann and len(ann['segmentation']) > 0:
-                # Take first polygon
                 seg = ann['segmentation'][0]
                 poly = np.array(seg, dtype=np.float32).reshape(-1, 2)
                 
                 # Normalize coordinates
-                poly[:, 0] = poly[:, 0] / original_w  # x coordinates
-                poly[:, 1] = poly[:, 1] / original_h  # y coordinates
+                poly[:, 0] = poly[:, 0] / original_w
+                poly[:, 1] = poly[:, 1] / original_h
                 
                 # Flatten and pad/crop to 16 values (8 points)
                 poly_flat = poly.flatten()
@@ -951,10 +979,10 @@ class VimTSDataset(Dataset):
                 
                 polygons.append(poly_flat)
             else:
-                # Default polygon (corners of bbox)
-                x1, y1, w, h = norm_box
-                x2 = x1 + w
-                y2 = y1 + h
+                # Default polygon from bbox
+                x1, y1, w, h = ann['bbox']
+                x1, x2 = x1 / original_w, (x1 + w) / original_w
+                y1, y2 = y1 / original_h, (y1 + h) / original_h
                 poly_flat = np.array([x1, y1, x2, y1, x2, y2, x1, y2] * 2, dtype=np.float32)[:16]
                 polygons.append(poly_flat)
             
@@ -963,43 +991,17 @@ class VimTSDataset(Dataset):
             tokens = []
             if isinstance(text_str, str):
                 for c in text_str:
-                    tokens.append(self.char_to_id.get(c, self.unk_token_id)) # Use get with unk_token_id
-            # elif isinstance(text_str, list): (Remove this if totaltext 'rec' is always string)
-            #     tokens = [min(int(t), self.vocab_size - 1) for t in text_str[:self.max_text_len]]
+                    tokens.append(self.char_to_id.get(c, self.unk_token_id))
             
             # Pad to max length
             tokens = tokens[:self.max_text_len] + [self.padding_token_id] * (self.max_text_len - len(tokens))
-            texts.append(tokens[:self.max_text_len])
-
-            # Ensure 'labels' in target are 0 for 'text' and not 1 (which would be background for DETR)
-            # If your dataset has multiple classes, adjust num_classes and label mapping accordingly.
-            # For simplicity with num_classes=1 (text), all positive labels should be 0.
-            labels.append(0) # Assign 0 for 'text' class
+            texts.append(tokens)
             
-            # if isinstance(text_str, str):
-            #     # Convert characters to token IDs
-            #     tokens = [min(ord(c), self.vocab_size - 1) for c in text_str[:self.max_text_len]]
-            # elif isinstance(text_str, list):
-            #     tokens = [min(int(t), self.vocab_size - 1) for t in text_str[:self.max_text_len]]
-            # else:
-            #     tokens = []
-            
-            # # Pad to max length
-            # tokens = tokens + [0] * (self.max_text_len - len(tokens))
-            # texts.append(tokens[:self.max_text_len])
-        
-        # Convert boxes to cxcywh
-        if len(boxes) > 0:
-            boxes = np.array(boxes)
-            cx = (boxes[:, 0] + boxes[:, 2] / 2)
-            cy = (boxes[:, 1] + boxes[:, 3] / 2)
-            w = boxes[:, 2]
-            h = boxes[:, 3]
-            boxes = np.stack([cx, cy, w, h], axis=-1)
+            # Label: 0 for text (num_classes=1, background=1)
+            labels.append(0)
         
         # Convert to tensors
         if len(labels) == 0:
-            # If no annotations, create empty tensors
             target = {
                 'labels': torch.zeros(0, dtype=torch.long),
                 'boxes': torch.zeros(0, 4, dtype=torch.float),
@@ -1010,12 +1012,11 @@ class VimTSDataset(Dataset):
             target = {
                 'labels': torch.tensor(labels, dtype=torch.long),
                 'boxes': torch.tensor(boxes, dtype=torch.float32),
-                'polygons': torch.tensor(np.array(polygons, dtype=np.float32), dtype=torch.float32),
+                'polygons': torch.tensor(polygons, dtype=torch.float32),
                 'texts': torch.tensor(texts, dtype=torch.long)
             }
         
         return image, target
-
 # ============================================================================
 # 8. TRAINING UTILITIES
 # ============================================================================
@@ -1076,14 +1077,14 @@ def train_vimts(dataset_path, num_epochs=10, batch_size=1, learning_rate=1e-4,
         split='train',
         image_size=(640, 640),
         max_text_len=25,
-        vocab_size=96  # Fixed to match actual vocabulary
+        vocab_size=96
     )
     
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=0,  # Reduce workers to avoid issues
+        num_workers=0,
         collate_fn=collate_fn,
         pin_memory=True if torch.cuda.is_available() else False
     )
@@ -1093,20 +1094,24 @@ def train_vimts(dataset_path, num_epochs=10, batch_size=1, learning_rate=1e-4,
     
     # Debug: Check first batch
     print("\nDebug: Checking first batch...")
-    for images, targets in train_loader:
-        print(f"Images shape: {images.shape}")
-        print(f"Number of targets: {len(targets)}")
-        for i, target in enumerate(targets):
-            print(f"  Target {i}:")
-            for key, value in target.items():
-                print(f"    {key}: {value.shape if isinstance(value, torch.Tensor) else value}")
-        break
+    try:
+        for images, targets in train_loader:
+            print(f"Images shape: {images.shape}")
+            print(f"Number of targets: {len(targets)}")
+            for i, target in enumerate(targets):
+                print(f"  Target {i}:")
+                for key, value in target.items():
+                    print(f"    {key}: {value.shape if isinstance(value, torch.Tensor) else value}")
+            break
+    except Exception as e:
+        print(f"Error loading first batch: {e}")
+        raise e
     
     # Create model
     print("\nInitializing model...")
     model = MemoryOptimizedVimTS(
         num_classes=1,  # Only text class
-        vocab_size=96,  # Match dataset vocabulary
+        vocab_size=96,
         max_text_len=25
     ).to(device)
     
@@ -1114,7 +1119,7 @@ def train_vimts(dataset_path, num_epochs=10, batch_size=1, learning_rate=1e-4,
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
+    print(f"Train FacTrainable parameters: {trainable_params:,}")
     
     # Loss and optimizer
     matcher = HungarianMatcher(
@@ -1167,6 +1172,11 @@ def train_vimts(dataset_path, num_epochs=10, batch_size=1, learning_rate=1e-4,
         
         for batch_idx, (images, targets) in enumerate(pbar):
             try:
+                # Validate batch
+                if not images.isfinite().all():
+                    print(f"Warning: Invalid image data in batch {batch_idx}")
+                    continue
+                
                 # Move to device
                 images = images.to(device, non_blocking=True)
                 targets = [{k: v.to(device) for k, v in target.items()} for target in targets]
@@ -1268,22 +1278,6 @@ def train_vimts(dataset_path, num_epochs=10, batch_size=1, learning_rate=1e-4,
     print("="*60)
     
     return model, train_losses
-
-def save_checkpoint(model, optimizer, epoch, loss, filepath):
-    """Save training checkpoint"""
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'loss': loss,
-        'model_config': {
-            'num_classes': 2,
-            'vocab_size': 100,
-            'max_text_len': 25
-        }
-    }
-    torch.save(checkpoint, filepath)
-    print(f"Checkpoint saved: {filepath}")
 
 # ============================================================================
 # 10. TESTING/INFERENCE
