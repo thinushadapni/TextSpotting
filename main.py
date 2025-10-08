@@ -1,6 +1,3 @@
-# Complete VimTS Implementation - All Components
-# File: complete_vimts.py
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,6 +15,60 @@ import math
 import gc
 import warnings
 warnings.filterwarnings('ignore')
+
+from scipy.optimize import linear_sum_assignment
+
+# Helper functions for box operations
+def box_cxcywh_to_xyxy(x):
+    x_c, y_c, w, h = x.unbind(-1)
+    b = [(x_c - 0.5 * w), (y_c - 0.5 * h),
+         (x_c + 0.5 * w), (y_c + 0.5 * h)]
+    return torch.stack(b, dim=-1)
+
+def box_xyxy_to_cxcywh(x):
+    x0, y0, x1, y1 = x.unbind(-1)
+    b = [(x0 + x1) / 2, (y0 + y1) / 2,
+         (x1 - x0), (y1 - y0)]
+    return torch.stack(b, dim=-1)
+
+def box_area(boxes):
+    return (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+
+def box_iou(boxes1, boxes2):
+    area1 = box_area(boxes1)
+    area2 = box_area(boxes2)
+
+    lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])  # [N,M,2]
+    rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])  # [N,M,2]
+
+    wh = (rb - lt).clamp(min=0)  # [N,M,2]
+    inter = wh[:, :, 0] * wh[:, :, 1]  # [N,M]
+
+    union = area1[:, None] + area2 - inter
+
+    iou = inter / union
+    return iou, union
+
+def generalized_box_iou(boxes1, boxes2):
+    """
+    Generalized IoU from https://giou.stanford.edu/
+    The boxes should be in [x0, y0, x1, y1] format
+    Returns a [N, M] pairwise matrix, where N = len(boxes1)
+    and M = len(boxes2)
+    """
+    # degenerate boxes gives inf / nan results
+    # so do an early check
+    assert (boxes1[:, 2:] >= boxes1[:, :2]).all()
+    assert (boxes2[:, 2:] >= boxes2[:, :2]).all()
+    iou, union = box_iou(boxes1, boxes2)
+
+    lt = torch.min(boxes1[:, :2], boxes2[:, :2])
+    rb = torch.max(boxes1[:, 2:], boxes2[:, 2:])
+
+    wh = (rb - lt).clamp(min=0)  # [N,M,2]
+    area = wh[:, :, 0] * wh[:, :, 1]
+
+    return iou - (area - union) / area
 
 # ============================================================================
 # 1. MEMORY-OPTIMIZED BACKBONE
@@ -54,10 +105,10 @@ class MemoryEfficientResNet50(nn.Module):
         
         # ResNet layers with gradient checkpointing
         if self.training:
-            c2 = checkpoint(self.layer1, x, use_reentrant=False)
-            c3 = checkpoint(self.layer2, c2, use_reentrant=False)
-            c4 = checkpoint(self.layer3, c3, use_reentrant=False)
-            c5 = checkpoint(self.layer4, c4, use_reentrant=False)
+            c2 = checkpoint(self.layer1, x)
+            c3 = checkpoint(self.layer2, c2)
+            c4 = checkpoint(self.layer3, c3)
+            c5 = checkpoint(self.layer4, c4)
         else:
             c2 = self.layer1(x)
             c3 = self.layer2(c2)
@@ -153,7 +204,7 @@ class EfficientTransformerEncoder(nn.Module):
         # Apply transformer layers
         for layer in self.layers:
             if self.training:
-                x = checkpoint(layer, x, use_reentrant=False)
+                x = checkpoint(layer, x)
             else:
                 x = layer(x)
         
@@ -349,7 +400,7 @@ class EfficientDecoder(nn.Module):
         
         for layer in self.layers:
             if self.training:
-                output = checkpoint(layer, output, memory_flat, use_reentrant=False)
+                output = checkpoint(layer, output, memory_flat)
             else:
                 output = layer(output, memory_flat)
         
@@ -583,7 +634,7 @@ class HungarianMatcher(nn.Module):
             # Hungarian matching
             try:
                 C_np = C.cpu().numpy()
-                row_ind, col_ind = scipy.optimize.linear_sum_assignment(C_np)
+                row_ind, col_ind = linear_sum_assignment(C_np)
                 indices.append((torch.as_tensor(row_ind, dtype=torch.int64, device=out_prob.device),
                               torch.as_tensor(col_ind, dtype=torch.int64, device=out_prob.device)))
             except Exception as e:
@@ -876,8 +927,8 @@ class VimTSDataset(Dataset):
             norm_box = [
                 x / original_w,
                 y / original_h, 
-                (x + w) / original_w,
-                (y + h) / original_h
+                w / original_w,
+                h / original_h
             ]
             boxes.append(norm_box)
             
@@ -901,7 +952,9 @@ class VimTSDataset(Dataset):
                 polygons.append(poly_flat)
             else:
                 # Default polygon (corners of bbox)
-                x1, y1, x2, y2 = norm_box
+                x1, y1, w, h = norm_box
+                x2 = x1 + w
+                y2 = y1 + h
                 poly_flat = np.array([x1, y1, x2, y1, x2, y2, x1, y2] * 2, dtype=np.float32)[:16]
                 polygons.append(poly_flat)
             
@@ -934,6 +987,15 @@ class VimTSDataset(Dataset):
             # # Pad to max length
             # tokens = tokens + [0] * (self.max_text_len - len(tokens))
             # texts.append(tokens[:self.max_text_len])
+        
+        # Convert boxes to cxcywh
+        if len(boxes) > 0:
+            boxes = np.array(boxes)
+            cx = (boxes[:, 0] + boxes[:, 2] / 2)
+            cy = (boxes[:, 1] + boxes[:, 3] / 2)
+            w = boxes[:, 2]
+            h = boxes[:, 3]
+            boxes = np.stack([cx, cy, w, h], axis=-1)
         
         # Convert to tensors
         if len(labels) == 0:
