@@ -597,19 +597,21 @@ class HungarianMatcher(nn.Module):
             import scipy.optimize
             import numpy as np
 
-            try:
-    # Handle cases where C might be empty or contain invalid values
-                if C.numel() == 0 or C.shape[1] == 0 or C.shape[0] == 0:
+            # Handle cases where C might be empty or contain invalid values
+            if C.numel() == 0 or C.shape[1] == 0 or C.shape[0] == 0:
+                indices = (np.array([]), np.array([]))
+            else:
+                # Replace inf/nan with large finite values for feasibility
+                C_clean = C.clone()
+                C_clean = torch.where(torch.isfinite(C_clean), C_clean, torch.tensor(1e8, device=C.device))
+                
+                try:
+                    indices = scipy.optimize.linear_sum_assignment(C_clean.cpu().numpy())
+                except ValueError as e:
+                    print(f"[WARNING] Matching failed at batch {i}: {e}")
+                    print(f"Cost matrix shape: {C.shape}, contains inf: {torch.isinf(C).any()}, contains nan: {torch.isnan(C).any()}")
                     indices = (np.array([]), np.array([]))
-                else:
-                    # Replace inf/nan with large finite values for feasibility
-                    C = torch.where(torch.isfinite(C), C, torch.full_like(C, 1e6))
-                    indices = scipy.optimize.linear_sum_assignment(C.cpu())
-            except ValueError as e:
-                print(f"[WARNING] Matching skipped due to infeasible cost matrix at batch {i}: {e}")
-            indices = (np.array([]), np.array([]))
-
-            cost_matrices.append(indices)
+                    cost_matrices.append(indices)
 
         return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in cost_matrices]
 
